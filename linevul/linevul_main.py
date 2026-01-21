@@ -279,14 +279,17 @@ def train(args, train_dataset, model, tokenizer, eval_dataset):
                         logger.info("  "+"*"*20)                          
                         
                         checkpoint_prefix = 'checkpoint-best-f1'
-                        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))                        
+                        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
                         if not os.path.exists(output_dir):
-                            os.makedirs(output_dir)                        
+                            os.makedirs(output_dir)
                         model_to_save = model.module if hasattr(model,'module') else model
-                        output_dir = os.path.join(output_dir, '{}'.format(args.model_name)) 
+                        output_dir = os.path.join(output_dir, '{}'.format(args.model_name))
                         torch.save(model_to_save.state_dict(), output_dir)
                         logger.info("Saving model checkpoint to %s", output_dir)
-                        
+
+                    # Save checkpoint after each epoch for resuming training
+                    save_checkpoint(args, model, optimizer, scheduler, idx, global_step, best_f1, tr_loss, logging_loss, tr_nb)
+
 def evaluate(args, model, tokenizer, eval_dataset, eval_when_training=False):
     #build dataloader
     eval_sampler = SequentialSampler(eval_dataset)
