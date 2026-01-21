@@ -112,76 +112,6 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-def save_checkpoint(args, model, optimizer, scheduler, epoch, global_step, best_f1, tr_loss, logging_loss, tr_nb):
-    """Save training checkpoint to resume training later."""
-    checkpoint_dir = os.path.join(args.output_dir, f'checkpoint-epoch-{epoch}')
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
-
-    checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint.pt')
-
-    # Get model state dict (handle DataParallel)
-    model_to_save = model.module if hasattr(model, 'module') else model
-
-    checkpoint = {
-        'epoch': epoch,
-        'global_step': global_step,
-        'model_state_dict': model_to_save.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'best_f1': best_f1,
-        'tr_loss': tr_loss,
-        'logging_loss': logging_loss,
-        'tr_nb': tr_nb,
-        'random_state': random.getstate(),
-        'np_random_state': np.random.get_state(),
-        'torch_random_state': torch.get_rng_state(),
-    }
-
-    if torch.cuda.is_available():
-        checkpoint['cuda_random_state'] = torch.cuda.get_rng_state_all()
-
-    torch.save(checkpoint, checkpoint_path)
-    logger.info(f"Checkpoint saved to {checkpoint_path}")
-
-    # Also save a 'latest' checkpoint for easy resuming
-    latest_path = os.path.join(args.output_dir, 'checkpoint-latest', 'checkpoint.pt')
-    latest_dir = os.path.join(args.output_dir, 'checkpoint-latest')
-    if not os.path.exists(latest_dir):
-        os.makedirs(latest_dir)
-    torch.save(checkpoint, latest_path)
-    logger.info(f"Latest checkpoint also saved to {latest_path}")
-
-def load_checkpoint(args, model, optimizer, scheduler):
-    """Load training checkpoint to resume training."""
-    checkpoint_path = args.resume_from_checkpoint
-
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    logger.info(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=args.device)
-
-    # Load model state
-    model_to_load = model.module if hasattr(model, 'module') else model
-    model_to_load.load_state_dict(checkpoint['model_state_dict'])
-
-    # Load optimizer and scheduler states
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-    # Restore random states for reproducibility
-    random.setstate(checkpoint['random_state'])
-    np.random.set_state(checkpoint['np_random_state'])
-    torch.set_rng_state(checkpoint['torch_random_state'])
-
-    if torch.cuda.is_available() and 'cuda_random_state' in checkpoint:
-        torch.cuda.set_rng_state_all(checkpoint['cuda_random_state'])
-
-    logger.info(f"Resumed from epoch {checkpoint['epoch']}, global_step {checkpoint['global_step']}, best_f1 {checkpoint['best_f1']}")
-
-    return checkpoint['epoch'], checkpoint['global_step'], checkpoint['best_f1'], checkpoint['tr_loss'], checkpoint['logging_loss'], checkpoint['tr_nb']
-
 def train(args, train_dataset, model, tokenizer, eval_dataset):
     """ Train the model """
     # build dataloader
@@ -209,33 +139,22 @@ def train(args, train_dataset, model, tokenizer, eval_dataset):
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
 
-    # Initialize training state
-    start_epoch = 0
-    global_step = 0
-    tr_loss, logging_loss, avg_loss, tr_nb, tr_num, train_loss = 0.0, 0.0, 0.0, 0, 0, 0
-    best_f1 = 0
-
-    # Resume from checkpoint if specified
-    if args.resume_from_checkpoint is not None:
-        start_epoch, global_step, best_f1, tr_loss, logging_loss, tr_nb = load_checkpoint(
-            args, model, optimizer, scheduler
-        )
-        start_epoch += 1  # Start from the next epoch
-        logger.info(f"Resuming training from epoch {start_epoch}")
-
     # Train!
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_dataset))
     logger.info("  Num Epochs = %d", args.epochs)
-    logger.info("  Starting from epoch = %d", start_epoch)
     logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size//max(args.n_gpu, 1))
     logger.info("  Total train batch size = %d",args.train_batch_size*args.gradient_accumulation_steps)
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", args.max_steps)
+    
+    global_step=0
+    tr_loss, logging_loss, avg_loss, tr_nb, tr_num, train_loss = 0.0, 0.0, 0.0, 0, 0, 0
+    best_f1=0
 
     model.zero_grad()
 
-    for idx in range(start_epoch, args.epochs): 
+    for idx in range(args.epochs): 
         bar = tqdm(train_dataloader,total=len(train_dataloader))
         tr_num = 0
         train_loss = 0
@@ -279,17 +198,14 @@ def train(args, train_dataset, model, tokenizer, eval_dataset):
                         logger.info("  "+"*"*20)                          
                         
                         checkpoint_prefix = 'checkpoint-best-f1'
-                        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
+                        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))                        
                         if not os.path.exists(output_dir):
-                            os.makedirs(output_dir)
+                            os.makedirs(output_dir)                        
                         model_to_save = model.module if hasattr(model,'module') else model
-                        output_dir = os.path.join(output_dir, '{}'.format(args.model_name))
+                        output_dir = os.path.join(output_dir, '{}'.format(args.model_name)) 
                         torch.save(model_to_save.state_dict(), output_dir)
                         logger.info("Saving model checkpoint to %s", output_dir)
-
-                    # Save checkpoint after each epoch for resuming training
-                    save_checkpoint(args, model, optimizer, scheduler, idx, global_step, best_f1, tr_loss, logging_loss, tr_nb)
-
+                        
 def evaluate(args, model, tokenizer, eval_dataset, eval_when_training=False):
     #build dataloader
     eval_sampler = SequentialSampler(eval_dataset)
@@ -1290,9 +1206,6 @@ def main():
     # bpe non-pretrained tokenizer
     parser.add_argument("--use_non_pretrained_tokenizer", default=False, action='store_true',
                         help="Whether to use non-pretrained bpe tokenizer.")
-    # Checkpoint resume for Colab session recovery
-    parser.add_argument("--resume_from_checkpoint", default=None, type=str,
-                        help="Path to checkpoint to resume training from (e.g., ./saved_models/checkpoint-epoch-3/checkpoint.pt)")
     args = parser.parse_args()
     # Setup CUDA, GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
