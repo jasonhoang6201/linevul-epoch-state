@@ -160,7 +160,7 @@ def load_checkpoint(args, model, optimizer, scheduler):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     logger.info(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=args.device)
+    checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=False)
 
     # Load model state
     model_to_load = model.module if hasattr(model, 'module') else model
