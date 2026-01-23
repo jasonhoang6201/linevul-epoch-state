@@ -173,7 +173,10 @@ def load_checkpoint(args, model, optimizer, scheduler):
     # Restore random states for reproducibility
     random.setstate(checkpoint['random_state'])
     np.random.set_state(checkpoint['np_random_state'])
-    torch.set_rng_state(checkpoint['torch_random_state'])
+    rng_state = checkpoint['torch_random_state']
+    if not isinstance(rng_state, torch.ByteTensor):
+        rng_state = torch.tensor(rng_state, dtype=torch.uint8).cpu()
+    torch.set_rng_state(rng_state)
 
     if torch.cuda.is_available() and 'cuda_random_state' in checkpoint:
         torch.cuda.set_rng_state_all(checkpoint['cuda_random_state'])
