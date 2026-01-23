@@ -179,7 +179,8 @@ def load_checkpoint(args, model, optimizer, scheduler):
     torch.set_rng_state(rng_state)
 
     if torch.cuda.is_available() and 'cuda_random_state' in checkpoint:
-        torch.cuda.set_rng_state_all(checkpoint['cuda_random_state'])
+        cuda_rng_states = [state.cpu().byte() for state in checkpoint['cuda_random_state']]
+        torch.cuda.set_rng_state_all(cuda_rng_states)
 
     logger.info(f"Resumed from epoch {checkpoint['epoch']}, global_step {checkpoint['global_step']}, best_f1 {checkpoint['best_f1']}")
 
