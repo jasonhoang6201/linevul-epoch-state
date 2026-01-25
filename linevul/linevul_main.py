@@ -112,8 +112,23 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-def save_checkpoint(args, model, optimizer, scheduler, epoch, global_step, best_f1, tr_loss, logging_loss, tr_nb):
-    """Save training checkpoint to resume training later."""
+def save_checkpoint(args, model, optimizer, scheduler, epoch, global_step, best_f1, tr_loss, logging_loss, tr_nb, step_in_epoch=None, total_steps_in_epoch=None):
+    """Save training checkpoint to resume training later.
+
+    Args:
+        args: Training arguments
+        model: The model to save
+        optimizer: Optimizer state
+        scheduler: LR scheduler state
+        epoch: Current epoch number
+        global_step: Global training step
+        best_f1: Best F1 score achieved
+        tr_loss: Total training loss
+        logging_loss: Loss at last logging point
+        tr_nb: Training batch count
+        step_in_epoch: Current step within the epoch (for mid-epoch saves)
+        total_steps_in_epoch: Total steps in one epoch
+    """
     checkpoint_dir = os.path.join(args.output_dir, f'checkpoint-epoch-{epoch}')
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
@@ -133,64 +148,198 @@ def save_checkpoint(args, model, optimizer, scheduler, epoch, global_step, best_
         'tr_loss': tr_loss,
         'logging_loss': logging_loss,
         'tr_nb': tr_nb,
+        'step_in_epoch': step_in_epoch,
+        'total_steps_in_epoch': total_steps_in_epoch,
+        'seed': args.seed,  # Save seed for fallback reproducibility
         'random_state': random.getstate(),
         'np_random_state': np.random.get_state(),
-        'torch_random_state': torch.get_rng_state(),
+        'torch_random_state': torch.get_rng_state().cpu(),  # Ensure CPU tensor
     }
 
     if torch.cuda.is_available():
-        checkpoint['cuda_random_state'] = torch.cuda.get_rng_state_all()
+        # Save per-GPU states as list of CPU tensors
+        checkpoint['cuda_random_state'] = [s.cpu() for s in torch.cuda.get_rng_state_all()]
+        checkpoint['n_gpu_saved'] = torch.cuda.device_count()  # Track GPU count
 
     torch.save(checkpoint, checkpoint_path)
     logger.info(f"Checkpoint saved to {checkpoint_path}")
 
     # Also save a 'latest' checkpoint for easy resuming
-    latest_path = os.path.join(args.output_dir, 'checkpoint-latest', 'checkpoint.pt')
     latest_dir = os.path.join(args.output_dir, 'checkpoint-latest')
     if not os.path.exists(latest_dir):
         os.makedirs(latest_dir)
+    latest_path = os.path.join(latest_dir, 'checkpoint.pt')
     torch.save(checkpoint, latest_path)
     logger.info(f"Latest checkpoint also saved to {latest_path}")
 
 def load_checkpoint(args, model, optimizer, scheduler):
-    """Load training checkpoint to resume training."""
+    """Load training checkpoint to resume training.
+
+    Returns:
+        tuple: (epoch, global_step, best_f1, tr_loss, logging_loss, tr_nb, step_in_epoch)
+               step_in_epoch will be None if checkpoint was saved at epoch end
+    """
     checkpoint_path = args.resume_from_checkpoint
 
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     logger.info(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=args.device)
+    checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=False)
 
     # Load model state
     model_to_load = model.module if hasattr(model, 'module') else model
     model_to_load.load_state_dict(checkpoint['model_state_dict'])
 
     # Load optimizer and scheduler states
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    # Handle device mismatch: move optimizer state tensors to correct device
+    optimizer_state = checkpoint['optimizer_state_dict']
+    for state in optimizer_state['state'].values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(args.device)
+    optimizer.load_state_dict(optimizer_state)
     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
     # Restore random states for reproducibility
-    random.setstate(checkpoint['random_state'])
-    np.random.set_state(checkpoint['np_random_state'])
-    torch.set_rng_state(checkpoint['torch_random_state'])
+    try:
+        random.setstate(checkpoint['random_state'])
+        np.random.set_state(checkpoint['np_random_state'])
 
-    if torch.cuda.is_available() and 'cuda_random_state' in checkpoint:
-        torch.cuda.set_rng_state_all(checkpoint['cuda_random_state'])
+        # torch.set_rng_state requires CPU tensor
+        torch_rng_state = checkpoint['torch_random_state']
+        if torch_rng_state.is_cuda:
+            torch_rng_state = torch_rng_state.cpu()
+        torch.set_rng_state(torch_rng_state)
+
+        # Handle CUDA RNG state with GPU count mismatch protection
+        if torch.cuda.is_available() and 'cuda_random_state' in checkpoint:
+            saved_states = checkpoint['cuda_random_state']
+            saved_n_gpu = checkpoint.get('n_gpu_saved', len(saved_states))
+            current_n_gpu = torch.cuda.device_count()
+
+            if saved_n_gpu == current_n_gpu:
+                # Same GPU count - restore all states
+                # Ensure states are on CPU before restoring
+                cpu_states = [s.cpu() if hasattr(s, 'cpu') else s for s in saved_states]
+                torch.cuda.set_rng_state_all(cpu_states)
+            else:
+                # GPU count mismatch - use seed-based fallback
+                logger.warning(f"GPU count changed ({saved_n_gpu} -> {current_n_gpu}). "
+                             f"Using seed-based CUDA RNG initialization.")
+                seed = checkpoint.get('seed', 42)
+                torch.cuda.manual_seed_all(seed)
+
+        logger.info("Random states restored successfully")
+    except Exception as e:
+        # Fallback to seed-based initialization if RNG restoration fails
+        logger.warning(f"Could not restore RNG states: {e}. Using seed-based fallback.")
+        seed = checkpoint.get('seed', 42)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    # Get step_in_epoch if it exists (for mid-epoch resume support)
+    step_in_epoch = checkpoint.get('step_in_epoch', None)
 
     logger.info(f"Resumed from epoch {checkpoint['epoch']}, global_step {checkpoint['global_step']}, best_f1 {checkpoint['best_f1']}")
+    if step_in_epoch is not None:
+        logger.info(f"Mid-epoch checkpoint: step {step_in_epoch} of {checkpoint.get('total_steps_in_epoch', 'unknown')}")
 
-    return checkpoint['epoch'], checkpoint['global_step'], checkpoint['best_f1'], checkpoint['tr_loss'], checkpoint['logging_loss'], checkpoint['tr_nb']
+    return (checkpoint['epoch'], checkpoint['global_step'], checkpoint['best_f1'],
+            checkpoint['tr_loss'], checkpoint['logging_loss'], checkpoint['tr_nb'], step_in_epoch)
+
+
+def list_checkpoints(output_dir):
+    """List all available checkpoints in the output directory.
+
+    Args:
+        output_dir: Directory where checkpoints are saved
+
+    Returns:
+        list: List of checkpoint info dictionaries sorted by epoch
+    """
+    checkpoints = []
+
+    if not os.path.exists(output_dir):
+        logger.warning(f"Output directory does not exist: {output_dir}")
+        return checkpoints
+
+    # Find all checkpoint directories
+    for item in os.listdir(output_dir):
+        item_path = os.path.join(output_dir, item)
+        if os.path.isdir(item_path) and item.startswith('checkpoint-'):
+            checkpoint_file = os.path.join(item_path, 'checkpoint.pt')
+            if os.path.exists(checkpoint_file):
+                try:
+                    # Load checkpoint metadata without loading full model weights
+                    checkpoint = torch.load(checkpoint_file, map_location='cpu', weights_only=False)
+                    info = {
+                        'path': checkpoint_file,
+                        'name': item,
+                        'epoch': checkpoint.get('epoch', -1),
+                        'global_step': checkpoint.get('global_step', -1),
+                        'best_f1': checkpoint.get('best_f1', 0),
+                        'step_in_epoch': checkpoint.get('step_in_epoch'),
+                        'total_steps_in_epoch': checkpoint.get('total_steps_in_epoch'),
+                    }
+                    checkpoints.append(info)
+                except Exception as e:
+                    logger.warning(f"Could not load checkpoint {checkpoint_file}: {e}")
+
+    # Sort by epoch, then by step_in_epoch
+    checkpoints.sort(key=lambda x: (x['epoch'], x.get('step_in_epoch') or float('inf')))
+
+    return checkpoints
+
+
+def print_available_checkpoints(output_dir):
+    """Print available checkpoints in a user-friendly format.
+
+    Args:
+        output_dir: Directory where checkpoints are saved
+    """
+    checkpoints = list_checkpoints(output_dir)
+
+    if not checkpoints:
+        print("\nNo checkpoints found in:", output_dir)
+        return
+
+    print("\n" + "="*70)
+    print("AVAILABLE CHECKPOINTS")
+    print("="*70)
+
+    for i, ckpt in enumerate(checkpoints):
+        step_info = ""
+        if ckpt['step_in_epoch'] is not None:
+            step_info = f" (step {ckpt['step_in_epoch']}/{ckpt['total_steps_in_epoch']})"
+
+        is_latest = ckpt['name'] == 'checkpoint-latest'
+        latest_marker = " [LATEST]" if is_latest else ""
+
+        print(f"\n[{i+1}] {ckpt['name']}{latest_marker}")
+        print(f"    Path: {ckpt['path']}")
+        print(f"    Epoch: {ckpt['epoch']}{step_info}")
+        print(f"    Global Step: {ckpt['global_step']}")
+        print(f"    Best F1: {ckpt['best_f1']:.4f}")
+
+    print("\n" + "="*70)
+    print("To resume training, use:")
+    print(f"  --resume_from_checkpoint <checkpoint_path>")
+    print("="*70 + "\n")
 
 def train(args, train_dataset, model, tokenizer, eval_dataset):
     """ Train the model """
     # build dataloader
     train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=0)
-    
-    args.max_steps = args.epochs * len(train_dataloader)
+
+    total_steps_in_epoch = len(train_dataloader)
+    args.max_steps = args.epochs * total_steps_in_epoch
     # evaluate the model per epoch
-    args.save_steps = len(train_dataloader)
+    args.save_steps = total_steps_in_epoch
     args.warmup_steps = args.max_steps // 5
     model.to(args.device)
 
@@ -212,34 +361,55 @@ def train(args, train_dataset, model, tokenizer, eval_dataset):
     # Initialize training state
     start_epoch = 0
     global_step = 0
+    start_step_in_epoch = 0  # For mid-epoch resume
     tr_loss, logging_loss, avg_loss, tr_nb, tr_num, train_loss = 0.0, 0.0, 0.0, 0, 0, 0
     best_f1 = 0
 
     # Resume from checkpoint if specified
     if args.resume_from_checkpoint is not None:
-        start_epoch, global_step, best_f1, tr_loss, logging_loss, tr_nb = load_checkpoint(
-            args, model, optimizer, scheduler
-        )
-        start_epoch += 1  # Start from the next epoch
-        logger.info(f"Resuming training from epoch {start_epoch}")
+        (start_epoch, global_step, best_f1, tr_loss, logging_loss, tr_nb,
+         step_in_epoch) = load_checkpoint(args, model, optimizer, scheduler)
+
+        if step_in_epoch is not None and step_in_epoch < total_steps_in_epoch - 1:
+            # Mid-epoch checkpoint: resume from the same epoch at next step
+            start_step_in_epoch = step_in_epoch + 1
+            logger.info(f"Resuming training from epoch {start_epoch}, step {start_step_in_epoch}")
+            logger.warning("Note: Mid-epoch resume with RandomSampler may process different batches "
+                          "than the original run. Model weights and optimizer state are preserved.")
+        else:
+            # End-of-epoch checkpoint: start from next epoch
+            start_epoch += 1
+            start_step_in_epoch = 0
+            logger.info(f"Resuming training from epoch {start_epoch}")
 
     # Train!
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_dataset))
     logger.info("  Num Epochs = %d", args.epochs)
     logger.info("  Starting from epoch = %d", start_epoch)
+    logger.info("  Starting from step = %d", start_step_in_epoch)
     logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size//max(args.n_gpu, 1))
-    logger.info("  Total train batch size = %d",args.train_batch_size*args.gradient_accumulation_steps)
+    logger.info("  Total train batch size = %d", args.train_batch_size*args.gradient_accumulation_steps)
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", args.max_steps)
+    logger.info("  Steps per epoch = %d", total_steps_in_epoch)
 
     model.zero_grad()
 
-    for idx in range(start_epoch, args.epochs): 
-        bar = tqdm(train_dataloader,total=len(train_dataloader))
+    for idx in range(start_epoch, args.epochs):
+        bar = tqdm(train_dataloader, total=len(train_dataloader))
         tr_num = 0
         train_loss = 0
+
+        # Determine starting step for this epoch (for mid-epoch resume)
+        epoch_start_step = start_step_in_epoch if idx == start_epoch else 0
+
         for step, batch in enumerate(bar):
+            # Skip steps if resuming from mid-epoch checkpoint
+            if step < epoch_start_step:
+                bar.set_description(f"epoch {idx} skipping step {step}/{epoch_start_step}")
+                continue
+
             (inputs_ids, labels) = [x.to(args.device) for x in batch]
             model.train()
             loss, logits = model(input_ids=inputs_ids, labels=labels)
@@ -256,39 +426,53 @@ def train(args, train_dataset, model, tokenizer, eval_dataset):
             train_loss += loss.item()
             if avg_loss == 0:
                 avg_loss = tr_loss
-                
-            avg_loss = round(train_loss/tr_num,5)
-            bar.set_description("epoch {} loss {}".format(idx,avg_loss))
-              
+
+            avg_loss = round(train_loss/tr_num, 5)
+            bar.set_description("epoch {} loss {}".format(idx, avg_loss))
+
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
-                scheduler.step()  
+                scheduler.step()
                 global_step += 1
-                output_flag=True
-                avg_loss=round(np.exp((tr_loss - logging_loss) /(global_step- tr_nb)),4)
+                output_flag = True
+                # Avoid division by zero when global_step == tr_nb (can happen on resume)
+                if global_step > tr_nb:
+                    avg_loss = round(np.exp((tr_loss - logging_loss) / (global_step - tr_nb)), 4)
 
+                # Save mid-epoch checkpoint periodically (every checkpoint_steps if specified)
+                if hasattr(args, 'checkpoint_steps') and args.checkpoint_steps > 0:
+                    if global_step % args.checkpoint_steps == 0 and global_step % args.save_steps != 0:
+                        logger.info(f"Saving mid-epoch checkpoint at step {step}")
+                        save_checkpoint(args, model, optimizer, scheduler, idx, global_step,
+                                        best_f1, tr_loss, logging_loss, tr_nb,
+                                        step_in_epoch=step, total_steps_in_epoch=total_steps_in_epoch)
+
+                # End of epoch: evaluate and save checkpoint
                 if global_step % args.save_steps == 0:
-                    results = evaluate(args, model, tokenizer, eval_dataset, eval_when_training=True)    
-                    
-                    # Save model checkpoint
-                    if results['eval_f1']>best_f1:
-                        best_f1=results['eval_f1']
-                        logger.info("  "+"*"*20)  
-                        logger.info("  Best f1:%s",round(best_f1,4))
-                        logger.info("  "+"*"*20)                          
-                        
-                        checkpoint_prefix = 'checkpoint-best-f1'
-                        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
-                        if not os.path.exists(output_dir):
-                            os.makedirs(output_dir)
-                        model_to_save = model.module if hasattr(model,'module') else model
-                        output_dir = os.path.join(output_dir, '{}'.format(args.model_name))
-                        torch.save(model_to_save.state_dict(), output_dir)
-                        logger.info("Saving model checkpoint to %s", output_dir)
+                    results = evaluate(args, model, tokenizer, eval_dataset, eval_when_training=True)
 
-                    # Save checkpoint after each epoch for resuming training
-                    save_checkpoint(args, model, optimizer, scheduler, idx, global_step, best_f1, tr_loss, logging_loss, tr_nb)
+                    # Save model checkpoint if best F1
+                    if results['eval_f1'] > best_f1:
+                        best_f1 = results['eval_f1']
+                        logger.info("  " + "*"*20)
+                        logger.info("  Best f1:%s", round(best_f1, 4))
+                        logger.info("  " + "*"*20)
+
+                        checkpoint_prefix = 'checkpoint-best-f1'
+                        best_output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
+                        if not os.path.exists(best_output_dir):
+                            os.makedirs(best_output_dir)
+                        model_to_save = model.module if hasattr(model, 'module') else model
+                        best_model_path = os.path.join(best_output_dir, '{}'.format(args.model_name))
+                        torch.save(model_to_save.state_dict(), best_model_path)
+                        logger.info("Saving model checkpoint to %s", best_model_path)
+
+        # Save checkpoint at end of each epoch (outside evaluation block for robustness)
+        logger.info(f"Epoch {idx} completed. Saving checkpoint...")
+        save_checkpoint(args, model, optimizer, scheduler, idx, global_step,
+                        best_f1, tr_loss, logging_loss, tr_nb,
+                        step_in_epoch=None, total_steps_in_epoch=total_steps_in_epoch)
 
 def evaluate(args, model, tokenizer, eval_dataset, eval_when_training=False):
     #build dataloader
@@ -1293,14 +1477,27 @@ def main():
     # Checkpoint resume for Colab session recovery
     parser.add_argument("--resume_from_checkpoint", default=None, type=str,
                         help="Path to checkpoint to resume training from (e.g., ./saved_models/checkpoint-epoch-3/checkpoint.pt)")
+    parser.add_argument("--checkpoint_steps", default=0, type=int,
+                        help="Save mid-epoch checkpoints every N steps (0 to disable). Useful for Colab/Kaggle to protect against session timeouts.")
+    parser.add_argument("--list_checkpoints", action='store_true',
+                        help="List all available checkpoints and exit. Useful to see which checkpoint to resume from.")
     args = parser.parse_args()
+
+    # Handle --list_checkpoints first (doesn't require model setup)
+    if args.list_checkpoints:
+        if args.output_dir:
+            print_available_checkpoints(args.output_dir)
+        else:
+            print("Error: --output_dir is required to list checkpoints")
+        return {}
+
     # Setup CUDA, GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.n_gpu = torch.cuda.device_count()
     args.device = device
     # Setup logging
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',datefmt='%m/%d/%Y %H:%M:%S',level=logging.INFO)
-    logger.warning("device: %s, n_gpu: %s",device, args.n_gpu,)
+    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s', datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
+    logger.warning("device: %s, n_gpu: %s", device, args.n_gpu,)
     # Set seed
     set_seed(args)
     config = RobertaConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
@@ -1330,7 +1527,7 @@ def main():
     if args.do_test:
         checkpoint_prefix = f'checkpoint-best-f1/{args.model_name}'
         output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))  
-        model.load_state_dict(torch.load(output_dir, map_location=args.device), strict=False)
+        model.load_state_dict(torch.load(output_dir, map_location=args.device, weights_only=False), strict=False)
         model.to(args.device)
         test_dataset = TextDataset(tokenizer, args, file_type='test')
         test(args, model, tokenizer, test_dataset, best_threshold=0.5)
