@@ -43,6 +43,91 @@ from tokenizers import Tokenizer
 
 logger = logging.getLogger(__name__)
 
+def save_checkpoint(args, model, optimizer, scheduler, epoch, global_step, best_f1, checkpoint_dir=None):
+    """Save training checkpoint including model, optimizer, scheduler, and training state."""
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join(args.output_dir, f'checkpoint-epoch-{epoch}')
+
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+
+    # Get model state dict (handle DataParallel)
+    model_to_save = model.module if hasattr(model, 'module') else model
+
+    checkpoint = {
+        'epoch': epoch,
+        'global_step': global_step,
+        'best_f1': best_f1,
+        'model_state_dict': model_to_save.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'rng_state': torch.get_rng_state(),
+        'np_rng_state': np.random.get_state(),
+        'python_rng_state': random.getstate(),
+    }
+
+    # Save CUDA RNG state if available
+    if torch.cuda.is_available():
+        checkpoint['cuda_rng_state'] = torch.cuda.get_rng_state_all()
+
+    checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint.pt')
+    torch.save(checkpoint, checkpoint_path)
+    logger.info(f"Saved checkpoint to {checkpoint_path}")
+
+    # Also save to 'checkpoint-latest' for easy resume
+    latest_dir = os.path.join(args.output_dir, 'checkpoint-latest')
+    if not os.path.exists(latest_dir):
+        os.makedirs(latest_dir)
+    latest_path = os.path.join(latest_dir, 'checkpoint.pt')
+    torch.save(checkpoint, latest_path)
+    logger.info(f"Saved latest checkpoint to {latest_path}")
+
+    return checkpoint_path
+
+def load_checkpoint(args, model, optimizer=None, scheduler=None):
+    """Load training checkpoint and restore training state."""
+    checkpoint_path = args.resume_from_checkpoint
+
+    # If path is a directory, look for checkpoint.pt inside
+    if os.path.isdir(checkpoint_path):
+        checkpoint_path = os.path.join(checkpoint_path, 'checkpoint.pt')
+
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
+
+    logger.info(f"Loading checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=args.device)
+
+    # Load model state dict
+    model_to_load = model.module if hasattr(model, 'module') else model
+    model_to_load.load_state_dict(checkpoint['model_state_dict'])
+
+    # Load optimizer state dict
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    # Load scheduler state dict
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    # Restore RNG states for reproducibility
+    if 'rng_state' in checkpoint:
+        torch.set_rng_state(checkpoint['rng_state'].cpu())
+    if 'np_rng_state' in checkpoint:
+        np.random.set_state(checkpoint['np_rng_state'])
+    if 'python_rng_state' in checkpoint:
+        random.setstate(checkpoint['python_rng_state'])
+    if torch.cuda.is_available() and 'cuda_rng_state' in checkpoint:
+        torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])
+
+    epoch = checkpoint.get('epoch', 0)
+    global_step = checkpoint.get('global_step', 0)
+    best_f1 = checkpoint.get('best_f1', 0)
+
+    logger.info(f"Resumed from epoch {epoch}, global_step {global_step}, best_f1 {best_f1}")
+
+    return epoch, global_step, best_f1
+
 class InputFeatures(object):
     """A single training/test features for a example."""
     def __init__(self,
@@ -117,7 +202,7 @@ def train(args, train_dataset, model, tokenizer, eval_dataset):
     # build dataloader
     train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=0)
-    
+
     args.max_steps = args.epochs * len(train_dataloader)
     # evaluate the model per epoch
     args.save_steps = len(train_dataloader)
@@ -139,22 +224,32 @@ def train(args, train_dataset, model, tokenizer, eval_dataset):
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
 
+    # Initialize training state
+    global_step = 0
+    tr_loss, logging_loss, avg_loss, tr_nb, tr_num, train_loss = 0.0, 0.0, 0.0, 0, 0, 0
+    best_f1 = 0
+    start_epoch = 0
+
+    # Resume from checkpoint if specified
+    if args.resume_from_checkpoint:
+        start_epoch, global_step, best_f1 = load_checkpoint(args, model, optimizer, scheduler)
+        # Start from the next epoch after the saved one
+        start_epoch += 1
+        logger.info(f"Resuming training from epoch {start_epoch}")
+
     # Train!
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_dataset))
     logger.info("  Num Epochs = %d", args.epochs)
+    logger.info("  Starting from epoch = %d", start_epoch)
     logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size//max(args.n_gpu, 1))
     logger.info("  Total train batch size = %d",args.train_batch_size*args.gradient_accumulation_steps)
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", args.max_steps)
-    
-    global_step=0
-    tr_loss, logging_loss, avg_loss, tr_nb, tr_num, train_loss = 0.0, 0.0, 0.0, 0, 0, 0
-    best_f1=0
 
     model.zero_grad()
 
-    for idx in range(args.epochs): 
+    for idx in range(start_epoch, args.epochs): 
         bar = tqdm(train_dataloader,total=len(train_dataloader))
         tr_num = 0
         train_loss = 0
@@ -188,23 +283,26 @@ def train(args, train_dataset, model, tokenizer, eval_dataset):
                 avg_loss=round(np.exp((tr_loss - logging_loss) /(global_step- tr_nb)),4)
 
                 if global_step % args.save_steps == 0:
-                    results = evaluate(args, model, tokenizer, eval_dataset, eval_when_training=True)    
-                    
-                    # Save model checkpoint
-                    if results['eval_f1']>best_f1:
-                        best_f1=results['eval_f1']
-                        logger.info("  "+"*"*20)  
-                        logger.info("  Best f1:%s",round(best_f1,4))
-                        logger.info("  "+"*"*20)                          
-                        
+                    results = evaluate(args, model, tokenizer, eval_dataset, eval_when_training=True)
+
+                    # Save model checkpoint if best F1
+                    if results['eval_f1'] > best_f1:
+                        best_f1 = results['eval_f1']
+                        logger.info("  "+"*"*20)
+                        logger.info("  Best f1:%s", round(best_f1, 4))
+                        logger.info("  "+"*"*20)
+
                         checkpoint_prefix = 'checkpoint-best-f1'
-                        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))                        
+                        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
                         if not os.path.exists(output_dir):
-                            os.makedirs(output_dir)                        
-                        model_to_save = model.module if hasattr(model,'module') else model
-                        output_dir = os.path.join(output_dir, '{}'.format(args.model_name)) 
+                            os.makedirs(output_dir)
+                        model_to_save = model.module if hasattr(model, 'module') else model
+                        output_dir = os.path.join(output_dir, '{}'.format(args.model_name))
                         torch.save(model_to_save.state_dict(), output_dir)
                         logger.info("Saving model checkpoint to %s", output_dir)
+
+                    # Save full checkpoint at the end of each epoch for resuming
+                    save_checkpoint(args, model, optimizer, scheduler, idx, global_step, best_f1)
                         
 def evaluate(args, model, tokenizer, eval_dataset, eval_when_training=False):
     #build dataloader
@@ -1179,6 +1277,9 @@ def main():
                         help="random seed for initialization")
     parser.add_argument('--epochs', type=int, default=1,
                         help="training epochs")
+    parser.add_argument("--resume_from_checkpoint", default=None, type=str,
+                        help="Path to checkpoint directory to resume training from. "
+                             "Use 'saved_models/checkpoint-latest' for latest checkpoint.")
     # RQ2
     parser.add_argument("--effort_at_top_k", default=0.2, type=float,
                         help="Effort@TopK%Recall: effort at catching top k percent of vulnerable lines")
