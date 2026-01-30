@@ -118,7 +118,14 @@ def load_checkpoint(args, model, optimizer=None, scheduler=None):
     if 'python_rng_state' in checkpoint:
         random.setstate(checkpoint['python_rng_state'])
     if torch.cuda.is_available() and 'cuda_rng_state' in checkpoint:
-        torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])
+        # Convert RNG states back to ByteTensor on CPU (required by set_rng_state_all)
+        cuda_rng_states = checkpoint['cuda_rng_state']
+        num_gpus = torch.cuda.device_count()
+        # Only restore RNG states for available GPUs
+        for i, state in enumerate(cuda_rng_states[:num_gpus]):
+            state_cpu = state.cpu() if state.device.type != 'cpu' else state
+            state_byte = state_cpu.to(torch.uint8) if state_cpu.dtype != torch.uint8 else state_cpu
+            torch.cuda.set_rng_state(state_byte, i)
 
     epoch = checkpoint.get('epoch', 0)
     global_step = checkpoint.get('global_step', 0)
