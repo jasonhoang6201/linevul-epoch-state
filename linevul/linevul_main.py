@@ -41,6 +41,7 @@ from captum.attr import LayerIntegratedGradients, DeepLift, DeepLiftShap, Gradie
 # word-level tokenizer
 from tokenizers import Tokenizer
 
+
 logger = logging.getLogger(__name__)
 
 def save_checkpoint(args, model, optimizer, scheduler, epoch, global_step, best_f1, checkpoint_dir=None):
@@ -362,6 +363,7 @@ def evaluate(args, model, tokenizer, eval_dataset, eval_when_training=False):
     for key in sorted(result.keys()):
         logger.info("  %s = %s", key, str(round(result[key],4)))
 
+
     return result
 
 def test(args, model, tokenizer, test_dataset, best_threshold=0.5):
@@ -411,6 +413,7 @@ def test(args, model, tokenizer, test_dataset, best_threshold=0.5):
     logger.info("***** Test results *****")
     for key in sorted(result.keys()):
         logger.info("  %s = %s", key, str(round(result[key],4)))
+
 
     logits = [l[1] for l in logits]
     result_df = generate_result_df(logits, y_trues, y_preds, args)
@@ -841,7 +844,8 @@ def line_level_localization_tp(flaw_lines: str, tokenizer, model, mini_batch, or
             input_ids = input_ids.to(args.device)
             labels = labels.to(args.device)
             ref_input_ids = ref_input_ids.to(args.device)
-            lig = LayerIntegratedGradients(lig_forward, model.encoder.roberta.embeddings)
+            model_to_use = model.module if hasattr(model, 'module') else model
+            lig = LayerIntegratedGradients(lig_forward, model_to_use.encoder.roberta.embeddings)
             attributions, delta = lig.attribute(inputs=input_ids,
                                                 baselines=ref_input_ids,
                                                 internal_batch_size=32,
@@ -870,7 +874,8 @@ def line_level_localization_tp(flaw_lines: str, tokenizer, model, mini_batch, or
              reasoning_method == "saliency":
             # send data to device
             input_ids = input_ids.to(args.device)
-            input_embed = model.encoder.roberta.embeddings(input_ids).to(args.device)
+            model_to_use = model.module if hasattr(model, 'module') else model
+            input_embed = model_to_use.encoder.roberta.embeddings(input_ids).to(args.device)
             if reasoning_method == "deeplift":
                 #baselines = torch.randn(1, 512, 768, requires_grad=True).to(args.device)
                 baselines = torch.zeros(1, 512, 768, requires_grad=True).to(args.device)
@@ -1000,7 +1005,8 @@ def line_level_localization(flaw_lines: str, tokenizer, model, mini_batch, origi
         labels = labels.to(args.device)
         ref_input_ids = ref_input_ids.to(args.device)
 
-        lig = LayerIntegratedGradients(lig_forward, model.encoder.roberta.embeddings)
+        model_to_use = model.module if hasattr(model, 'module') else model
+        lig = LayerIntegratedGradients(lig_forward, model_to_use.encoder.roberta.embeddings)
 
         attributions, delta = lig.attribute(inputs=input_ids,
                                             baselines=ref_input_ids,
@@ -1026,7 +1032,8 @@ def line_level_localization(flaw_lines: str, tokenizer, model, mini_batch, origi
             reasoning_method == "saliency":
         # send data to device
         input_ids = input_ids.to(args.device)
-        input_embed = model.encoder.roberta.embeddings(input_ids).to(args.device)
+        model_to_use = model.module if hasattr(model, 'module') else model
+        input_embed = model_to_use.encoder.roberta.embeddings(input_ids).to(args.device)
         if reasoning_method == "deeplift":
             #baselines = torch.randn(1, 512, 768, requires_grad=True).to(args.device)
             baselines = torch.zeros(1, 512, 768, requires_grad=True).to(args.device)
