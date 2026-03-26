@@ -423,6 +423,8 @@ def test(args, model, tokenizer, test_dataset, best_threshold=0.5):
     # define reasoning method
     if args.reasoning_method == "all":
             all_reasoning_method = ["attention", "lig", "saliency", "deeplift", "deeplift_shap", "gradient_shap"]
+    elif args.reasoning_method == "exclude_lig":
+            all_reasoning_method = ["attention", "saliency", "deeplift", "deeplift_shap", "gradient_shap"]
     else:
         all_reasoning_method = [args.reasoning_method]
 
